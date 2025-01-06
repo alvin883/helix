@@ -142,7 +142,9 @@ mod external {
                     .is_some()
             }
 
-            if env_var_is_set("WAYLAND_DISPLAY")
+            if env_var_is_set("WEZTERM_UNIX_SOCKET") && binary_exists("wezterm") {
+                Self::Termcode
+            } else if env_var_is_set("WAYLAND_DISPLAY")
                 && binary_exists("wl-copy")
                 && binary_exists("wl-paste")
             {
