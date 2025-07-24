@@ -1,5 +1,6 @@
 pub(crate) mod dap;
 pub(crate) mod lsp;
+pub(crate) mod syntax;
 pub(crate) mod typed;
 
 pub use dap::*;
@@ -11,6 +12,7 @@ use helix_stdx::{
 };
 use helix_vcs::{FileChange, Hunk};
 pub use lsp::*;
+pub use syntax::*;
 use tui::{
     text::{Span, Spans},
     widgets::Cell,
@@ -34,7 +36,7 @@ use helix_core::{
     regex::{self, Regex},
     search::{self, CharMatcher},
     selection, surround,
-    syntax::{BlockCommentToken, LanguageServerFeature},
+    syntax::config::{BlockCommentToken, LanguageServerFeature},
     text_annotations::{Overlay, TextAnnotations},
     textobject,
     unicode::width::UnicodeWidthChar,
@@ -146,10 +148,10 @@ impl Context<'_> {
     #[inline]
     pub fn callback<T, F>(
         &mut self,
-        call: impl Future<Output = helix_lsp::Result<serde_json::Value>> + 'static + Send,
+        call: impl Future<Output = helix_lsp::Result<T>> + 'static + Send,
         callback: F,
     ) where
-        T: for<'de> serde::Deserialize<'de> + Send + 'static,
+        T: Send + 'static,
         F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
     {
         self.jobs.callback(make_job_callback(call, callback));
@@ -175,16 +177,15 @@ impl Context<'_> {
 
 #[inline]
 fn make_job_callback<T, F>(
-    call: impl Future<Output = helix_lsp::Result<serde_json::Value>> + 'static + Send,
+    call: impl Future<Output = helix_lsp::Result<T>> + 'static + Send,
     callback: F,
 ) -> std::pin::Pin<Box<impl Future<Output = Result<Callback, anyhow::Error>>>>
 where
-    T: for<'de> serde::Deserialize<'de> + Send + 'static,
+    T: Send + 'static,
     F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
 {
     Box::pin(async move {
-        let json = call.await?;
-        let response = serde_json::from_value(json)?;
+        let response = call.await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, compositor: &mut Compositor| {
                 callback(editor, compositor, response)
@@ -406,9 +407,13 @@ impl MappableCommand {
         buffer_picker, "Open buffer picker",
         jumplist_picker, "Open jumplist picker",
         symbol_picker, "Open symbol picker",
+        syntax_symbol_picker, "Open symbol picker from syntax information",
+        lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
+        syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
+        lsp_or_syntax_workspace_symbol_picker, "Open workspace symbol picker from LSP or syntax information",
         diagnostics_picker, "Open diagnostic picker",
         workspace_diagnostics_picker, "Open workspace diagnostic picker",
         last_picker, "Open last picker",
@@ -427,6 +432,8 @@ impl MappableCommand {
         goto_implementation, "Goto implementation",
         goto_file_start, "Goto line number <n> else file start",
         goto_file_end, "Goto file end",
+        extend_to_file_start, "Extend to line number<n> else file start",
+        extend_to_file_end, "Extend to file end",
         goto_file, "Goto files/URLs in selections",
         goto_file_hsplit, "Goto files in selections (hsplit)",
         goto_file_vsplit, "Goto files in selections (vsplit)",
@@ -439,6 +446,7 @@ impl MappableCommand {
         goto_last_modification, "Goto last modification",
         goto_line, "Goto line",
         goto_last_line, "Goto last line",
+        extend_to_last_line, "Extend to last line",
         goto_first_diag, "Goto first diagnostic",
         goto_last_diag, "Goto last diagnostic",
         goto_next_diag, "Goto next diagnostic",
@@ -449,6 +457,8 @@ impl MappableCommand {
         goto_last_change, "Goto last change",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
+        goto_column, "Goto column",
+        extend_to_column, "Extend to column",
         goto_next_buffer, "Goto next buffer",
         goto_previous_buffer, "Goto previous buffer",
         goto_line_end_newline, "Goto newline at line end",
@@ -561,6 +571,8 @@ impl MappableCommand {
         goto_prev_comment, "Goto previous comment",
         goto_next_test, "Goto next test",
         goto_prev_test, "Goto previous test",
+        goto_next_xml_element, "Goto next (X)HTML element",
+        goto_prev_xml_element, "Goto previous (X)HTML element",
         goto_next_entry, "Goto next pairing",
         goto_prev_entry, "Goto previous pairing",
         goto_next_paragraph, "Goto next paragraph",
@@ -595,8 +607,10 @@ impl MappableCommand {
         command_palette, "Open command palette",
         goto_word, "Jump to a two-character label",
         extend_to_word, "Extend to a two-character label",
-        goto_next_tabstop, "goto next snippet placeholder",
-        goto_prev_tabstop, "goto next snippet placeholder",
+        goto_next_tabstop, "Goto next snippet placeholder",
+        goto_prev_tabstop, "Goto next snippet placeholder",
+        rotate_selections_first, "Make the first selection your primary one",
+        rotate_selections_last, "Make the last selection your primary one",
     );
 }
 
@@ -1254,28 +1268,44 @@ fn goto_next_paragraph(cx: &mut Context) {
 }
 
 fn goto_file_start(cx: &mut Context) {
+    goto_file_start_impl(cx, Movement::Move);
+}
+
+fn extend_to_file_start(cx: &mut Context) {
+    goto_file_start_impl(cx, Movement::Extend);
+}
+
+fn goto_file_start_impl(cx: &mut Context, movement: Movement) {
     if cx.count.is_some() {
-        goto_line(cx);
+        goto_line_impl(cx, movement);
     } else {
         let (view, doc) = current!(cx.editor);
         let text = doc.text().slice(..);
         let selection = doc
             .selection(view.id)
             .clone()
-            .transform(|range| range.put_cursor(text, 0, cx.editor.mode == Mode::Select));
+            .transform(|range| range.put_cursor(text, 0, movement == Movement::Extend));
         push_jump(view, doc);
         doc.set_selection(view.id, selection);
     }
 }
 
 fn goto_file_end(cx: &mut Context) {
+    goto_file_end_impl(cx, Movement::Move);
+}
+
+fn extend_to_file_end(cx: &mut Context) {
+    goto_file_end_impl(cx, Movement::Extend)
+}
+
+fn goto_file_end_impl(cx: &mut Context, movement: Movement) {
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
     let pos = doc.text().len_chars();
     let selection = doc
         .selection(view.id)
         .clone()
-        .transform(|range| range.put_cursor(text, pos, cx.editor.mode == Mode::Select));
+        .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
     push_jump(view, doc);
     doc.set_selection(view.id, selection);
 }
@@ -3483,12 +3513,12 @@ fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
     enter_insert_mode(cx);
 
     let (view, doc) = current!(cx.editor);
+    let loader = cx.editor.syn_loader.load();
 
     let text = doc.text().slice(..);
     let contents = doc.text();
     let selection = doc.selection(view.id);
 
-    let language_config = doc.language_config();
     let syntax = doc.syntax();
     let tab_width = doc.tab_width();
 
@@ -3504,7 +3534,7 @@ fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
             let line_end_index = cursor_line_start;
 
             let indent = indent::indent_for_newline(
-                language_config,
+                &loader,
                 syntax,
                 &doc.config.load().indent_heuristic,
                 &doc.indent_style,
@@ -3614,6 +3644,7 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
     enter_insert_mode(cx);
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
+    let loader = cx.editor.syn_loader.load();
 
     let text = doc.text().slice(..);
     let contents = doc.text();
@@ -3663,7 +3694,7 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
         let indent = match line.first_non_whitespace_char() {
             Some(pos) if continue_comment_token.is_some() => line.slice(..pos).to_string(),
             _ => indent::indent_for_newline(
-                doc.language_config(),
+                &loader,
                 doc.syntax(),
                 &config.indent_heuristic,
                 &doc.indent_style,
@@ -3703,11 +3734,13 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
             .map(|token| token.len() + 1) // `+ 1` for the extra space added
             .unwrap_or_default();
         for i in 0..count {
-            // pos                    -> beginning of reference line,
-            // + (i * (1+indent_len + comment_len)) -> beginning of i'th line from pos (possibly including comment token)
+            // pos                     -> beginning of reference line,
+            // + (i * (line_ending_len + indent_len + comment_len)) -> beginning of i'th line from pos (possibly including comment token)
             // + indent_len + comment_len ->        -> indent for i'th line
             ranges.push(Range::point(
-                pos + (i * (1 + indent_len + comment_len)) + indent_len + comment_len,
+                pos + (i * (doc.line_ending.len_chars() + indent_len + comment_len))
+                    + indent_len
+                    + comment_len,
             ));
         }
 
@@ -3741,21 +3774,30 @@ fn normal_mode(cx: &mut Context) {
 }
 
 // Store a jump on the jumplist.
-fn push_jump(view: &mut View, doc: &Document) {
+fn push_jump(view: &mut View, doc: &mut Document) {
+    doc.append_changes_to_history(view);
     let jump = (doc.id(), doc.selection(view.id).clone());
     view.jumps.push(jump);
 }
 
 fn goto_line(cx: &mut Context) {
+    goto_line_impl(cx, Movement::Move);
+}
+
+fn goto_line_impl(cx: &mut Context, movement: Movement) {
     if cx.count.is_some() {
         let (view, doc) = current!(cx.editor);
         push_jump(view, doc);
 
-        goto_line_without_jumplist(cx.editor, cx.count);
+        goto_line_without_jumplist(cx.editor, cx.count, movement);
     }
 }
 
-fn goto_line_without_jumplist(editor: &mut Editor, count: Option<NonZeroUsize>) {
+fn goto_line_without_jumplist(
+    editor: &mut Editor,
+    count: Option<NonZeroUsize>,
+    movement: Movement,
+) {
     if let Some(count) = count {
         let (view, doc) = current!(editor);
         let text = doc.text().slice(..);
@@ -3770,13 +3812,21 @@ fn goto_line_without_jumplist(editor: &mut Editor, count: Option<NonZeroUsize>) 
         let selection = doc
             .selection(view.id)
             .clone()
-            .transform(|range| range.put_cursor(text, pos, editor.mode == Mode::Select));
+            .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
 
         doc.set_selection(view.id, selection);
     }
 }
 
 fn goto_last_line(cx: &mut Context) {
+    goto_last_line_impl(cx, Movement::Move)
+}
+
+fn extend_to_last_line(cx: &mut Context) {
+    goto_last_line_impl(cx, Movement::Extend)
+}
+
+fn goto_last_line_impl(cx: &mut Context, movement: Movement) {
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
     let line_idx = if text.line(text.len_lines() - 1).len_chars() == 0 {
@@ -3789,9 +3839,31 @@ fn goto_last_line(cx: &mut Context) {
     let selection = doc
         .selection(view.id)
         .clone()
-        .transform(|range| range.put_cursor(text, pos, cx.editor.mode == Mode::Select));
+        .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
 
     push_jump(view, doc);
+    doc.set_selection(view.id, selection);
+}
+
+fn goto_column(cx: &mut Context) {
+    goto_column_impl(cx, Movement::Move);
+}
+
+fn extend_to_column(cx: &mut Context) {
+    goto_column_impl(cx, Movement::Extend);
+}
+
+fn goto_column_impl(cx: &mut Context, movement: Movement) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id).clone().transform(|range| {
+        let line = range.cursor_line(text);
+        let line_start = text.line_to_char(line);
+        let line_end = line_end_char_index(&text, line);
+        let pos = graphemes::nth_next_grapheme_boundary(text, line_start, count - 1).min(line_end);
+        range.put_cursor(text, pos, movement == Movement::Extend)
+    });
     doc.set_selection(view.id, selection);
 }
 
@@ -4127,6 +4199,7 @@ pub mod insert {
     pub fn insert_newline(cx: &mut Context) {
         let config = cx.editor.config();
         let (view, doc) = current_ref!(cx.editor);
+        let loader = cx.editor.syn_loader.load();
         let text = doc.text().slice(..);
         let line_ending = doc.line_ending.as_str();
 
@@ -4145,6 +4218,7 @@ pub mod insert {
             None
         };
 
+        let mut last_pos = 0;
         let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
             // Tracks the number of trailing whitespace characters deleted by this selection.
             let mut chars_deleted = 0;
@@ -4166,13 +4240,14 @@ pub mod insert {
             let (from, to, local_offs) = if let Some(idx) =
                 text.slice(line_start..pos).last_non_whitespace_char()
             {
-                let first_trailing_whitespace_char = (line_start + idx + 1).min(pos);
+                let first_trailing_whitespace_char = (line_start + idx + 1).clamp(last_pos, pos);
+                last_pos = pos;
                 let line = text.line(current_line);
 
                 let indent = match line.first_non_whitespace_char() {
                     Some(pos) if continue_comment_token.is_some() => line.slice(..pos).to_string(),
                     _ => indent::indent_for_newline(
-                        doc.language_config(),
+                        &loader,
                         doc.syntax(),
                         &config.indent_heuristic,
                         &doc.indent_style,
@@ -4905,7 +4980,10 @@ fn format_selections(cx: &mut Context) {
         )
         .unwrap();
 
-    let edits = tokio::task::block_in_place(|| helix_lsp::block_on(future)).unwrap_or_default();
+    let edits = tokio::task::block_in_place(|| helix_lsp::block_on(future))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     let transaction =
         helix_lsp::util::generate_transaction_from_edits(doc.text(), edits, offset_encoding);
@@ -5224,6 +5302,21 @@ fn rotate_selections_forward(cx: &mut Context) {
 }
 fn rotate_selections_backward(cx: &mut Context) {
     rotate_selections(cx, Direction::Backward)
+}
+
+fn rotate_selections_first(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let mut selection = doc.selection(view.id).clone();
+    selection.set_primary_index(0);
+    doc.set_selection(view.id, selection);
+}
+
+fn rotate_selections_last(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let mut selection = doc.selection(view.id).clone();
+    let len = selection.len();
+    selection.set_primary_index(len - 1);
+    doc.set_selection(view.id, selection);
 }
 
 enum ReorderStrategy {
@@ -5726,19 +5819,14 @@ fn goto_ts_object_impl(cx: &mut Context, object: &'static str, direction: Direct
     let count = cx.count();
     let motion = move |editor: &mut Editor| {
         let (view, doc) = current!(editor);
-        if let Some((lang_config, syntax)) = doc.language_config().zip(doc.syntax()) {
+        let loader = editor.syn_loader.load();
+        if let Some(syntax) = doc.syntax() {
             let text = doc.text().slice(..);
             let root = syntax.tree().root_node();
 
             let selection = doc.selection(view.id).clone().transform(|range| {
                 let new_range = movement::goto_treesitter_object(
-                    text,
-                    range,
-                    object,
-                    direction,
-                    root,
-                    lang_config,
-                    count,
+                    text, range, object, direction, &root, syntax, &loader, count,
                 );
 
                 if editor.mode == Mode::Select {
@@ -5802,6 +5890,14 @@ fn goto_prev_test(cx: &mut Context) {
     goto_ts_object_impl(cx, "test", Direction::Backward)
 }
 
+fn goto_next_xml_element(cx: &mut Context) {
+    goto_ts_object_impl(cx, "xml-element", Direction::Forward)
+}
+
+fn goto_prev_xml_element(cx: &mut Context) {
+    goto_ts_object_impl(cx, "xml-element", Direction::Backward)
+}
+
 fn goto_next_entry(cx: &mut Context) {
     goto_ts_object_impl(cx, "entry", Direction::Forward)
 }
@@ -5826,21 +5922,15 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
         if let Some(ch) = event.char() {
             let textobject = move |editor: &mut Editor| {
                 let (view, doc) = current!(editor);
+                let loader = editor.syn_loader.load();
                 let text = doc.text().slice(..);
 
                 let textobject_treesitter = |obj_name: &str, range: Range| -> Range {
-                    let (lang_config, syntax) = match doc.language_config().zip(doc.syntax()) {
-                        Some(t) => t,
-                        None => return range,
+                    let Some(syntax) = doc.syntax() else {
+                        return range;
                     };
                     textobject::textobject_treesitter(
-                        text,
-                        range,
-                        objtype,
-                        obj_name,
-                        syntax.tree().root_node(),
-                        lang_config,
-                        count,
+                        text, range, objtype, obj_name, syntax, &loader, count,
                     )
                 };
 
@@ -5875,6 +5965,7 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
                         'c' => textobject_treesitter("comment", range),
                         'T' => textobject_treesitter("test", range),
                         'e' => textobject_treesitter("entry", range),
+                        'x' => textobject_treesitter("xml-element", range),
                         'p' => textobject::textobject_paragraph(text, range, objtype, count),
                         'm' => textobject::textobject_pair_surround_closest(
                             doc.syntax(),
@@ -5919,6 +6010,7 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
         ("e", "Data structure entry (tree-sitter)"),
         ("m", "Closest surrounding pair (tree-sitter)"),
         ("g", "Change"),
+        ("x", "X(HTML) element (tree-sitter)"),
         (" ", "... or any character acting as a pair"),
     ];
 
@@ -6313,7 +6405,7 @@ fn shell_prompt(cx: &mut Context, prompt: Cow<'static, str>, behavior: ShellBeha
         cx,
         prompt,
         Some('|'),
-        ui::completers::filename,
+        ui::completers::shell,
         move |cx, input: &str, event: PromptEvent| {
             if event != PromptEvent::Validate {
                 return;
@@ -6656,6 +6748,10 @@ fn jump_to_word(cx: &mut Context, behaviour: Movement) {
     // Calculate the jump candidates: ranges for any visible words with two or
     // more characters.
     let alphabet = &cx.editor.config().jump_label_alphabet;
+    if alphabet.is_empty() {
+        return;
+    }
+
     let jump_label_limit = alphabet.len() * alphabet.len();
     let mut words = Vec::with_capacity(jump_label_limit);
     let (view, doc) = current_ref!(cx.editor);
@@ -6744,4 +6840,35 @@ fn jump_to_word(cx: &mut Context, behaviour: Movement) {
         }
     }
     jump_to_label(cx, words, behaviour)
+}
+
+fn lsp_or_syntax_symbol_picker(cx: &mut Context) {
+    let doc = doc!(cx.editor);
+
+    if doc
+        .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
+        .next()
+        .is_some()
+    {
+        lsp::symbol_picker(cx);
+    } else if doc.syntax().is_some() {
+        syntax_symbol_picker(cx);
+    } else {
+        cx.editor
+            .set_error("No language server supporting document symbols or syntax info available");
+    }
+}
+
+fn lsp_or_syntax_workspace_symbol_picker(cx: &mut Context) {
+    let doc = doc!(cx.editor);
+
+    if doc
+        .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
+        .next()
+        .is_some()
+    {
+        lsp::workspace_symbol_picker(cx);
+    } else {
+        syntax_workspace_symbol_picker(cx);
+    }
 }
