@@ -671,7 +671,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 .min(snapshot.matched_item_count().saturating_sub(1))
         }
 
-        let text_style = cx.editor.theme.get("ui.text");
+        let text_style = cx.editor.theme.get("ui.text.picker");
         let selected = cx.editor.theme.get("ui.text.focus");
         let highlight_style = cx.editor.theme.get("special").add_modifier(Modifier::BOLD);
 
